@@ -1,0 +1,50 @@
+{
+  "name": "Kharcha — money tracker",
+  "short_name": "Kharcha",
+  "description": "Track bank, cash, who gave you money and where it went.",
+  "start_url": "./#/home",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F2F4F8",
+  "theme_color": "#083B48",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Add by voice",
+      "short_name": "Voice",
+      "url": "./?voice#/home",
+      "icons": [
+        {
+          "src": "icons/icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    },
+    {
+      "name": "Trips",
+      "url": "./#/trips"
+    },
+    {
+      "name": "Insights",
+      "url": "./#/insights"
+    }
+  ]
+}
