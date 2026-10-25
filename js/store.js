@@ -1,4 +1,5 @@
 // Kharcha data store — localStorage, sync-ready (every record has id, updatedAt, deleted)
+import { EXT, shareOf, spendAmt as ruleSpend, incomeAmt as ruleIncome, personNets } from './rules.js';
 const KEY = 'kharcha.v1';
 const EPOCH = '1970-01-01T00:00:00.000Z'; // seeds are "oldest" so synced data always wins over defaults
 export const COLLECTIONS = ['wallets', 'people', 'categories', 'txns', 'trips', 'budgets', 'goals', 'recurring'];
@@ -29,12 +30,12 @@ const SEED_CATEGORIES = [
   ['gifts', 'Gifts', '🎁', '#E2A93B', 'expense'], ['other', 'Other', '✨', '#8D9AAE', 'expense'],
   ['lent', 'Lent to someone', '🤲', '#0F8FA0', 'expense', { ext: true, needsPerson: true }],
   ['repay', 'Repaid a loan', '↩️', '#A06CD5', 'expense', { ext: true, needsPerson: true }],
-  ['settle-out', 'Trip settle-up', '🧾', '#5B7FA6', 'expense', { ext: true, hidden: true }],
+  ['settle-out', 'Settle-up', '🧾', '#5B7FA6', 'expense', { ext: true, hidden: true }],
   ['pocket', 'Pocket money', '💸', '#22A06B', 'income'], ['gift-in', 'Gift', '🎁', '#E2A93B', 'income'],
   ['loan-in', 'Loan (to repay)', '🤝', '#E4566B', 'income'], ['refund', 'Refund', '↩️', '#3E8ED0', 'income'],
   ['scholar', 'Scholarship / stipend', '🎓', '#7A6FE0', 'income'], ['other-in', 'Other', '✨', '#8D9AAE', 'income'],
   ['got-back', 'Got money back', '🔙', '#0F8FA0', 'income', { ext: true }],
-  ['settle-in', 'Trip settle-up', '🧾', '#5B7FA6', 'income', { ext: true, hidden: true }],
+  ['settle-in', 'Settle-up', '🧾', '#5B7FA6', 'income', { ext: true, hidden: true }],
 ].map(([id, name, icon, color, type, extra]) => ({ id, name, icon, color, type, ...(extra || {}), updatedAt: EPOCH }));
 
 export const COLORS = ['#2B6CB0', '#D45A9A', '#22A06B', '#F08A4B', '#7A6FE0', '#2E9E8F', '#E4566B', '#C98A5E', '#0F8FA0', '#A06CD5'];
@@ -42,7 +43,7 @@ export const COLORS = ['#2B6CB0', '#D45A9A', '#22A06B', '#F08A4B', '#7A6FE0', '#
 function fresh() {
   return {
     version: 2,
-    settings: { id: 'settings', name: '', theme: 'system', onboarded: false, updatedAt: EPOCH },
+    settings: { id: 'settings', name: '', theme: 'system', onboarded: false, upi: '', notify: { daily: true, dailyTime: '21:30', bills: true, weekly: true }, updatedAt: EPOCH },
     wallets: [
       { id: 'sbi', name: 'SBI Bank', kind: 'bank', opening: 0, color: '#4C8BE8', updatedAt: EPOCH },
       { id: 'cash', name: 'Cash in hand', kind: 'cash', opening: 0, color: '#F4A93B', updatedAt: EPOCH },
@@ -61,11 +62,13 @@ function migrate(s) {
   for (const k of COLLECTIONS) if (!Array.isArray(s[k])) s[k] = [];
   if (!s.settings) s.settings = f.settings;
   s.settings.id = 'settings';
+  if (!s.settings.notify) s.settings.notify = { ...f.settings.notify };
+  if (s.settings.upi === undefined) s.settings.upi = '';
   // add new built-in categories; refresh flags on existing built-ins
   for (const c of SEED_CATEGORIES) {
     const ex = s.categories.find((x) => x.id === c.id);
     if (!ex) s.categories.push({ ...c });
-    else Object.assign(ex, { ext: c.ext, needsPerson: c.needsPerson, hidden: c.hidden });
+    else Object.assign(ex, { ext: c.ext, needsPerson: c.needsPerson, hidden: c.hidden, ...(c.ext ? { name: c.name } : {}) });
   }
   s.version = 2;
   return s;
@@ -160,7 +163,7 @@ export const person = (id) => state.people.find((p) => p.id === id);
 export const wallet = (id) => state.wallets.find((w) => w.id === id) || { name: '' };
 export const trip = (id) => state.trips.find((t) => t.id === id);
 export const categories = (type, { all = false } = {}) => state.categories.filter((c) => c.type === type && !c.deleted && (all || !c.hidden));
-export const isExt = (t) => !!cat(t.categoryId).ext;
+export const isExt = (t) => EXT.has(t.categoryId);
 
 export function balances() {
   const b = Object.fromEntries(state.wallets.map((w) => [w.id, +w.opening || 0]));
@@ -172,15 +175,10 @@ export function balances() {
   return b;
 }
 
-const shareCount = (t) => (t.split && t.split.length ? t.split.length : 1);
-const iAmIn = (t) => !t.split || !t.split.length || t.split.includes('me');
+export { shareOf, personNets };
 // What this transaction cost *you* (your share), used for all spending stats
-export function spendAmt(t) {
-  if (t.type === 'expense') { if (isExt(t)) return 0; return iAmIn(t) ? t.amount / shareCount(t) : 0; }
-  if (t.type === 'tripshare') return iAmIn(t) ? t.amount / shareCount(t) : 0;
-  return 0;
-}
-export const incomeAmt = (t) => (t.type === 'income' && !isExt(t) ? t.amount : 0);
+export const spendAmt = ruleSpend;
+export const incomeAmt = ruleIncome;
 
 export const monthKey = (d) => d.slice(0, 7);
 export const inMonth = (list, ym) => list.filter((t) => t.date.startsWith(ym));
@@ -193,43 +191,37 @@ export const spent = (list) => list.reduce((s, t) => s + spendAmt(t), 0);
 export const received = (list) => list.reduce((s, t) => s + incomeAmt(t), 0);
 export const spends = (list) => list.filter((t) => spendAmt(t) > 0);
 
-// Loans and money returned, per person (outside trips)
+// Everything between you and one person: loans, splits and settle-ups
+export const allNets = () => personNets(txns());
 export function ledger(pid) {
-  const l = { given: 0, borrowed: 0, repaid: 0, lent: 0, gotBack: 0 };
+  const l = { borrowed: 0, repaid: 0, lent: 0, gotBack: 0, splitOwed: 0, splitOwe: 0, settledIn: 0, settledOut: 0 };
   for (const t of txns()) {
-    if (t.personId !== pid || t.tripId && (t.categoryId === 'settle-in' || t.categoryId === 'settle-out')) continue;
-    if (t.type === 'income') {
+    if (t.type === 'expense') {
+      if (t.personId === pid && t.categoryId === 'lent') l.lent += t.amount;
+      else if (t.personId === pid && t.categoryId === 'repay') l.repaid += t.amount;
+      else if (t.personId === pid && t.categoryId === 'settle-out') l.settledOut += t.amount;
+      else if (!isExt(t) && t.split && t.split.includes(pid)) l.splitOwed += shareOf(t, pid);
+    } else if (t.type === 'tripshare' && t.personId === pid) l.splitOwe += shareOf(t, 'me');
+    else if (t.type === 'income' && t.personId === pid) {
       if (t.categoryId === 'loan-in') l.borrowed += t.amount;
       else if (t.categoryId === 'got-back') l.gotBack += t.amount;
-      if (!isExt(t)) l.given += t.amount;
-    } else if (t.type === 'expense') {
-      if (t.categoryId === 'repay') l.repaid += t.amount;
-      if (t.categoryId === 'lent') l.lent += t.amount;
+      else if (t.categoryId === 'settle-in') l.settledIn += t.amount;
     }
   }
-  l.iOwe = Math.max(0, l.borrowed - l.repaid);
-  l.owesMe = Math.max(0, l.lent - l.gotBack);
+  l.net = allNets()[pid] || 0;
+  l.owesMe = Math.max(0, l.net);
+  l.iOwe = Math.max(0, -l.net);
   return l;
 }
 
-// Trip totals and who owes whom (positive net = they owe you)
+// Trip totals and who owes whom within the trip (positive net = they owe you)
 export function tripStats(id) {
   const list = txns().filter((t) => t.tripId === id);
-  const s = { list, group: 0, mine: 0, net: {}, byCat: [], byDay: [] };
-  const add = (p, v) => { s.net[p] = (s.net[p] || 0) + v; };
+  const s = { list, group: 0, mine: 0, net: personNets(list), byCat: [], byDay: [] };
   for (const t of list) {
-    const n = shareCount(t);
-    if (t.type === 'expense' && !isExt(t)) {
-      s.group += t.amount;
-      (t.split || []).filter((p) => p !== 'me').forEach((p) => add(p, t.amount / n));
-    } else if (t.type === 'tripshare') {
-      s.group += t.amount;
-      if (iAmIn(t)) add(t.personId, -t.amount / n);
-    } else if (t.categoryId === 'settle-out') add(t.personId, t.amount);
-    else if (t.categoryId === 'settle-in') add(t.personId, -t.amount);
+    if ((t.type === 'expense' && !isExt(t)) || t.type === 'tripshare') s.group += t.amount;
     s.mine += spendAmt(t);
   }
-  for (const k of Object.keys(s.net)) if (Math.abs(s.net[k]) < 0.5) s.net[k] = 0;
   s.byCat = sumBy(list, (t) => t.categoryId, spendAmt);
   s.byDay = sumBy(list, (t) => t.date, spendAmt).sort((a, b) => a[0].localeCompare(b[0]));
   return s;

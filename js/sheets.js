@@ -1,4 +1,4 @@
-import { store, txns, people, cat, person, wallet, trips, trip, goals, recurring, categories, balances, inMonth, spent, spendAmt, incomeAmt, received, ledger, budgetStatus, activeTrip, payBill, COLORS, MODES, INCOME_MODES } from './store.js';
+import { store, txns, people, cat, person, wallet, trips, trip, goals, recurring, categories, balances, inMonth, spent, spendAmt, incomeAmt, received, ledger, budgetStatus, activeTrip, payBill, shareOf, isExt as isExtCat, COLORS, MODES, INCOME_MODES } from './store.js';
 import { esc, money, compact, todayISO, nowTime, parseISO, dayLabel, icon, toast, openSheet, shiftMonth } from './ui.js';
 import { $, bus, ui, rememberMode, txTitle, modeLabel } from './shared.js';
 import { parseCommand, listen, speak, speechSupported } from './voice.js';
@@ -46,40 +46,108 @@ function budgetAlert(before, rec) {
   return cross(before.overall, after.overall, 'Monthly') || c;
 }
 
+const r2 = (n) => Math.round(n * 100) / 100;
+const nameOf = (id) => (id === 'me' ? 'You' : person(id)?.name || 'Someone');
+const andList = (arr) => (arr.length <= 1 ? arr.join('') : `${arr.slice(0, -1).join(', ')} and ${arr[arr.length - 1]}`);
+
+// Who is in a split and for how much
+function splitShares(d) {
+  const amt = parseFloat(d.amount) || 0;
+  const ids = d.split && d.split.length ? d.split : ['me'];
+  if (d.splitMode === 'exact') return Object.fromEntries(ids.map((id) => [id, parseFloat(d.exact?.[id]) || 0]));
+  return Object.fromEntries(ids.map((id) => [id, amt / ids.length]));
+}
+function splitSummary(d) {
+  const amt = parseFloat(d.amount) || 0;
+  const sh = splitShares(d);
+  const ids = Object.keys(sh);
+  if (d.splitMode === 'exact') {
+    const sum = ids.reduce((a, id) => a + sh[id], 0);
+    if (Math.abs(sum - amt) >= 0.5) return { warn: true, text: sum < amt ? `${money(amt - sum)} still to assign` : `${money(sum - amt)} more than the bill` };
+  }
+  if (d.payer === 'me' || !d.payer) {
+    const others = ids.filter((id) => id !== 'me' && sh[id] > 0);
+    if (!others.length) return { text: 'Only you. Tap friends to split this bill.' };
+    const same = d.splitMode !== 'exact';
+    return { text: same ? `${money(amt / ids.length)} each. ${andList(others.map(nameOf))} ${others.length > 1 ? 'owe' : 'owes'} you ${money(amt / ids.length)}${others.length > 1 ? ' each' : ''}.` : `${others.map((id) => `${nameOf(id)} owes you ${money(sh[id])}`).join(', ')}.` };
+  }
+  const mine = sh.me || 0;
+  return { text: mine > 0 ? `${nameOf(d.payer)} paid. You owe ${nameOf(d.payer)} ${money(mine)}. Your SBI and cash don’t change.` : `${nameOf(d.payer)} paid and you’re not part of this one, so you owe nothing.` };
+}
+
 // Build + save a transaction from a draft (used by the add sheet and by voice)
 export function commitTxn(d, { editing = false } = {}) {
-  const amt = Math.round(parseFloat(d.amount) * 100) / 100;
-  const rec = { id: d.id, type: d.type, amount: amt, date: d.date || todayISO(), time: d.time || nowTime(), note: (d.note || '').trim() };
-  if (d.type === 'expense') {
+  const amt = r2(parseFloat(d.amount));
+  const rec = { id: d.id, type: d.type === 'tripshare' ? 'expense' : d.type, amount: amt, date: d.date || todayISO(), time: d.time || nowTime(), note: (d.note || '').trim() };
+  if (rec.type === 'expense') {
     const c = cat(d.categoryId);
-    Object.assign(rec, { categoryId: d.categoryId, mode: d.mode, walletId: MODES[d.mode].wallet, personId: c.needsPerson || c.id === 'settle-out' ? d.personId || null : null, tripId: d.tripId || null, split: d.tripId && !c.ext && d.split && d.split.length > 1 ? d.split : null });
-    rememberMode('expense', d.mode);
-  } else if (d.type === 'income') {
-    Object.assign(rec, { categoryId: d.categoryId, mode: d.mode, walletId: INCOME_MODES[d.mode].wallet, personId: d.personId || null, tripId: d.categoryId === 'settle-in' ? d.tripId : null });
+    const ids = d.split && d.split.length ? d.split : ['me'];
+    const payer = d.payer || 'me';
+    const splitting = d.splitOn && !c.ext && !(ids.length === 1 && ids[0] === 'me' && payer === 'me');
+    const split = splitting ? ids : null;
+    const shares = splitting && d.splitMode === 'exact' ? Object.fromEntries(Object.entries(splitShares(d)).map(([k, v]) => [k, r2(v)])) : null;
+    if (splitting && payer !== 'me') {
+      Object.assign(rec, { type: 'tripshare', categoryId: d.categoryId, personId: payer, tripId: d.tripId || null, split, shares, mode: null, walletId: null });
+    } else {
+      Object.assign(rec, { categoryId: d.categoryId, mode: d.mode, walletId: MODES[d.mode].wallet, personId: c.needsPerson || c.id === 'settle-out' ? d.personId || null : null, tripId: d.tripId || null, split, shares });
+      rememberMode('expense', d.mode);
+    }
+  } else if (rec.type === 'income') {
+    Object.assign(rec, { categoryId: d.categoryId, mode: d.mode, walletId: INCOME_MODES[d.mode].wallet, personId: d.personId || null, tripId: d.categoryId === 'settle-in' ? d.tripId || null : null, split: null, shares: null });
     rememberMode('income', d.mode);
-  } else if (d.type === 'tripshare') {
-    Object.assign(rec, { categoryId: d.categoryId, personId: d.personId, tripId: d.tripId, split: d.split, mode: null, walletId: null });
   } else {
-    Object.assign(rec, { walletId: d.walletId, toWalletId: d.toWalletId, mode: null, categoryId: null, personId: null });
+    Object.assign(rec, { walletId: d.walletId, toWalletId: d.toWalletId, mode: null, categoryId: null, personId: null, split: null, shares: null });
   }
   const before = budgetStatus(rec.date.slice(0, 7));
   store.saveTxn(rec);
   const alert = budgetAlert(before, rec);
-  const msg = editing ? 'Changes saved' : rec.type === 'expense' ? `Expense of ${money(amt)} added` : rec.type === 'income' ? `${money(amt)} received added` : rec.type === 'tripshare' ? 'Shared expense added' : `${money(amt)} moved`;
+  const msg = editing ? 'Changes saved' : rec.type === 'tripshare' ? 'Shared expense added' : rec.split ? `Split of ${money(amt)} added` : rec.type === 'expense' ? `Expense of ${money(amt)} added` : rec.type === 'income' ? `${money(amt)} received added` : `${money(amt)} moved`;
   toast(alert ? `${msg}. ${alert}` : msg, alert ? 'warn' : '');
   return rec;
 }
 
 // ---------- add / edit ----------
-export function openAdd({ type = 'expense', tx = null, personId = null, tripId = null, draft = null } = {}) {
-  if (tx && tx.type === 'tripshare') return openFriendPaid({ tx });
+export function openAdd({ type = 'expense', tx = null, personId = null, tripId = null, draft = null, split = false, splitWith = [], payer = 'me' } = {}) {
   const editing = !!tx;
   const src = tx || draft;
-  const d = src ? { split: null, ...src } : { type, amount: '', date: todayISO(), time: nowTime(), note: '', mode: ui.lastMode[type === 'income' ? 'income' : 'expense'], categoryId: type === 'income' ? 'pocket' : 'food', personId: type === 'income' ? (personId || people()[0]?.id || null) : null, walletId: 'sbi', toWalletId: 'cash', tripId: type === 'expense' ? (tripId || activeTrip()?.id || null) : null, split: null };
+  let d;
+  if (src) {
+    d = { split: null, shares: null, ...src };
+    if (d.type === 'tripshare') { d.type = 'expense'; d.payer = src.personId; d.splitOn = true; d.mode = ui.lastMode.expense; }
+    else if (d.type === 'expense' && d.split && d.split.length) { d.splitOn = true; d.payer = 'me'; }
+    d.payer = d.payer || 'me';
+    d.splitMode = d.shares ? 'exact' : d.splitMode || 'equal';
+    d.exact = d.shares ? Object.fromEntries(Object.entries(d.shares).map(([k, v]) => [k, String(v)])) : {};
+  } else {
+    d = { type, amount: '', date: todayISO(), time: nowTime(), note: '', mode: ui.lastMode[type === 'income' ? 'income' : 'expense'], categoryId: type === 'income' ? 'pocket' : 'food', personId: type === 'income' ? (personId || people()[0]?.id || null) : null, walletId: 'sbi', toWalletId: 'cash', tripId: type === 'expense' ? (tripId || (split ? null : activeTrip()?.id) || null) : null, split: null, shares: null, splitOn: false, payer: 'me', splitMode: 'equal', exact: {} };
+    if (split) { d.splitOn = true; d.split = ['me', ...splitWith.filter((x) => x !== 'me')]; d.payer = payer || 'me'; if (tripId) d.tripId = tripId; }
+  }
   if (!d.time) d.time = nowTime();
   if (d.type === 'income' && !INCOME_MODES[d.mode]) d.mode = 'upi';
   if (d.type === 'expense' && !MODES[d.mode]) d.mode = 'upi';
   if (d.type === 'transfer') { d.walletId = d.walletId || 'sbi'; d.toWalletId = d.toWalletId || 'cash'; }
+
+  const candidates = () => {
+    const tr = d.tripId ? trip(d.tripId) : null;
+    const pool = tr && (tr.members || []).length ? tr.members.map(person).filter(Boolean) : people();
+    const rank = (p) => (p.relation === 'Family' ? 1 : 0);
+    return [...pool].sort((a, b) => rank(a) - rank(b));
+  };
+  const splitBlock = () => {
+    if (!d.splitOn) return `<button class="toggle" data-splittoggle><span class="tg-text"><strong>Split this bill</strong><span>Share it with friends and keep track of who owes whom</span></span><span class="tg-sw"></span></button>`;
+    const ids = d.split && d.split.length ? d.split : ['me'];
+    const pc = (p, attr, on) => `<button class="chip person-chip ${on ? 'on' : ''}" data-${attr}="${p.id}" style="--c:${p.color}"><span class="pdot">${esc(p.name[0])}</span>${esc(p.name)}</button>`;
+    const payers = ['me', ...ids.filter((x) => x !== 'me'), ...(d.payer !== 'me' && !ids.includes(d.payer) ? [d.payer] : [])];
+    const sm = splitSummary(d);
+    return `<div class="split-box">
+      <div class="split-head"><strong>Split this bill</strong><button class="link" data-splittoggle>Don’t split</button></div>
+      <div class="field"><span>Split between</span><div class="chips tight"><button class="chip ${ids.includes('me') ? 'on' : ''}" data-sp="me">Me</button>${candidates().map((p) => pc(p, 'sp', ids.includes(p.id))).join('')}<button class="chip add" data-newperson="split">${icon('plus', 16)} New</button></div></div>
+      <div class="field"><span>Who paid</span><div class="chips tight">${payers.map((id) => (id === 'me' ? `<button class="chip ${d.payer === 'me' ? 'on' : ''}" data-payer="me">Me</button>` : pc(person(id), 'payer', d.payer === id))).join('')}</div></div>
+      <div class="seg">${[['equal', 'Equally'], ['exact', 'Exact amounts']].map(([k, l]) => `<button class="${d.splitMode === k ? 'on' : ''}" data-smode="${k}">${l}</button>`).join('')}</div>
+      ${d.splitMode === 'exact' ? `<div class="share-rows">${ids.map((id) => `<label class="share-row"><span>${esc(nameOf(id))}</span><span class="money-in"><span>₹</span><input inputmode="decimal" data-money data-share="${id}" value="${esc(d.exact[id] ?? '')}" placeholder="0"></span></label>`).join('')}</div>` : ''}
+      <p class="from-note ${sm.warn ? 'warn' : ''}" id="split-sum">${esc(sm.text)}</p>
+    </div>`;
+  };
 
   const body = () => {
     const b = balances();
@@ -90,23 +158,15 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
     if (d.type === 'expense') {
       const w = MODES[d.mode]?.wallet || 'sbi';
       const avail = b[w] + (editing && tx.type === 'expense' && tx.walletId === w ? tx.amount : 0);
-      const tr = d.tripId ? trip(d.tripId) : null;
       const openTrips = trips().filter((t) => !t.archived || t.id === d.tripId);
-      const members = tr ? (tr.members || []).filter((m) => person(m)) : [];
-      const split = d.split && d.split.length ? d.split : ['me'];
+      const friendPaid = d.splitOn && d.payer !== 'me';
       mid = c.hidden ? `<div class="locked-cat"><span class="tile sm" style="--c:${c.color}">${c.icon}</span>${esc(c.name)}${d.personId ? ` with ${esc(person(d.personId)?.name || '')}` : ''}</div>`
-        : `<div class="field"><span>Category</span><div class="cats">${categories('expense').map((x) => `<button class="cat ${d.categoryId === x.id ? 'on' : ''}" data-cat="${x.id}" style="--c:${x.color}"><span>${x.icon}</span>${esc(x.name)}</button>`).join('')}</div></div>`;
+        : `<div class="field"><span>Category</span><div class="cats">${categories('expense').filter((x) => !(d.splitOn && x.ext)).map((x) => `<button class="cat ${d.categoryId === x.id ? 'on' : ''}" data-cat="${x.id}" style="--c:${x.color}"><span>${x.icon}</span>${esc(x.name)}</button>`).join('')}</div></div>`;
       if (c.needsPerson) mid += `<div class="field"><span>${d.categoryId === 'lent' ? 'Lent to' : 'Repaid to'}</span>${peopleChips(d.personId, 'pp')}</div>`;
-      mid += `<div class="field"><span>Paid with</span>${chipRow(Object.entries(MODES).map(([k, m]) => [k, m.label]), d.mode, 'mode')}
-        <p class="from-note ${(+d.amount || 0) > avail ? 'warn' : ''}">${w === 'cash' ? icon('cash', 16) : icon('bank', 16)} From ${wallet(w).name}, ${money(avail)} available</p></div>`;
-      if (openTrips.length && !c.ext) {
-        mid += `<div class="field"><span>Trip</span><div class="chips tight"><button class="chip ${!d.tripId ? 'on' : ''}" data-trip="">No trip</button>${openTrips.map((t) => `<button class="chip ${d.tripId === t.id ? 'on' : ''}" data-trip="${t.id}">${t.emoji || '🧳'} ${esc(t.name)}</button>`).join('')}</div></div>`;
-        if (tr && members.length) {
-          const n = split.length;
-          mid += `<div class="field"><span>Split with</span><div class="chips tight"><button class="chip ${split.includes('me') ? 'on' : ''}" data-split="me">Me</button>${members.map((m) => { const p = person(m); return `<button class="chip person-chip ${split.includes(m) ? 'on' : ''}" data-split="${m}" style="--c:${p.color}"><span class="pdot">${esc(p.name[0])}</span>${esc(p.name)}</button>`; }).join('')}<button class="chip add" data-splitall>Everyone</button></div>
-          <p class="from-note">${n > 1 ? `${money((+d.amount || 0) / n)} each. ${split.includes('me') ? 'Your share counts as your spending; the rest is owed to you.' : 'You paid for them, so all of it is owed to you.'}` : 'Only you. Tap friends to split this equally.'}</p></div>`;
-        }
-      }
+      if (!c.ext) mid += splitBlock();
+      if (!friendPaid) mid += `<div class="field"><span>Paid with</span>${chipRow(Object.entries(MODES).map(([k, m]) => [k, m.label]), d.mode, 'mode')}
+        <p class="from-note ${(+d.amount || 0) > avail ? 'warn' : ''}" id="wallet-note">${w === 'cash' ? icon('cash', 16) : icon('bank', 16)} From ${wallet(w).name}, ${money(avail)} available</p></div>`;
+      if (openTrips.length && !c.ext) mid += `<div class="field"><span>Trip</span><div class="chips tight"><button class="chip ${!d.tripId ? 'on' : ''}" data-trip="">No trip</button>${openTrips.map((t) => `<button class="chip ${d.tripId === t.id ? 'on' : ''}" data-trip="${t.id}">${t.emoji || '🧳'} ${esc(t.name)}</button>`).join('')}</div></div>`;
     } else if (d.type === 'income') {
       const w = INCOME_MODES[d.mode]?.wallet || 'sbi';
       if (c.hidden) mid = `<div class="locked-cat"><span class="tile sm" style="--c:${c.color}">${c.icon}</span>${esc(c.name)} from ${esc(person(d.personId)?.name || '')}</div>`;
@@ -122,10 +182,11 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
       </div><p class="from-note">${d.walletId === 'sbi' ? 'Use this for ATM withdrawals.' : 'Use this when you deposit cash into SBI.'}</p></div>`;
     }
     const lockedType = editing || c.hidden;
-    const seg = lockedType ? `<h2 class="sheet-title">${editing ? 'Edit' : 'Record'} ${d.type === 'expense' ? (c.hidden ? 'payment' : 'expense') : d.type === 'income' ? 'money received' : 'move'}</h2>` : `<div class="seg big">${[['expense', 'Spent'], ['income', 'Received'], ['transfer', 'Move']].map(([k, l]) => `<button class="${d.type === k ? 'on ' + k : ''}" data-type="${k}">${l}</button>`).join('')}</div>`;
+    const seg = lockedType ? `<h2 class="sheet-title">${editing ? 'Edit' : 'Record'} ${d.type === 'expense' ? (d.splitOn ? 'split' : c.hidden ? 'payment' : 'expense') : d.type === 'income' ? 'money received' : 'move'}</h2>` : `<div class="seg big">${[['expense', 'Spent'], ['income', 'Received'], ['transfer', 'Move']].map(([k, l]) => `<button class="${d.type === k ? 'on ' + k : ''}" data-type="${k}">${l}</button>`).join('')}</div>`;
+    const saveLabel = editing ? 'Save changes' : d.type === 'expense' ? (d.splitOn ? 'Save split' : c.hidden || c.ext ? 'Save payment' : 'Add expense') : d.type === 'income' ? 'Add money received' : 'Move money';
     return `<div class="sheet-head">${seg}${!editing && speechSupported() ? `<button class="icon-btn" data-voice-in aria-label="Speak instead">${icon('mic', 20)}</button>` : ''}<button class="icon-btn" data-close aria-label="Close">${icon('x')}</button></div>
       <div class="sheet-body">${amountInput(d.amount)}${mid}${date}${note}</div>
-      <div class="sheet-foot">${editing ? `<button class="btn danger-ghost" data-deltx aria-label="Delete">${icon('trash', 18)}</button>` : ''}<button class="btn primary wide ${d.type}" data-save>${editing ? 'Save changes' : d.type === 'expense' ? (c.hidden || c.ext ? 'Save payment' : 'Add expense') : d.type === 'income' ? 'Add money received' : 'Move money'}</button></div>`;
+      <div class="sheet-foot">${editing ? `<button class="btn danger-ghost" data-deltx aria-label="Delete">${icon('trash', 18)}</button>` : ''}<button class="btn primary wide ${d.type === 'expense' && d.splitOn && d.payer !== 'me' ? 'transfer' : d.type}" data-save>${saveLabel}</button></div>`;
   };
 
   openSheet('<div class="sheet-inner"></div>', (sheet, close) => {
@@ -137,13 +198,16 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
       const tm = $('#time', inner); if (tm) d.time = tm.value;
     };
     const draw = (focus) => { const st = $('.sheet-body', inner)?.scrollTop || 0; inner.innerHTML = body(); fitAmount(inner); $('.sheet-body', inner).scrollTop = st; if (focus) setTimeout(() => $('#amt', inner)?.focus(), 260); };
-    draw(!editing && !draft);
+    const refreshSummary = () => { const el = $('#split-sum', inner); if (!el) return; const sm = splitSummary(d); el.textContent = sm.text; el.classList.toggle('warn', !!sm.warn); };
+    draw(!editing && (!draft || !draft.amount));
     inner.addEventListener('input', (e) => {
       cleanAmount(e);
+      if (e.target.dataset.share) { d.exact[e.target.dataset.share] = e.target.value; refreshSummary(); return; }
       if (e.target.id !== 'amt') return;
       fitAmount(inner);
       d.amount = e.target.value;
-      const note = $('.from-note', inner);
+      refreshSummary();
+      const note = $('#wallet-note', inner);
       if (d.type === 'expense' && note) {
         const w = MODES[d.mode].wallet;
         const avail = balances()[w] + (editing && tx.type === 'expense' && tx.walletId === w ? tx.amount : 0);
@@ -162,21 +226,38 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
         d.categoryId = d.type === 'income' ? 'pocket' : 'food';
         d.personId = d.type === 'income' ? (d.personId || people()[0]?.id || null) : null;
         d.tripId = d.type === 'expense' ? (d.tripId || activeTrip()?.id || null) : null;
+        d.splitOn = false;
+        draw();
+      } else if ('splittoggle' in ds) {
+        d.splitOn = !d.splitOn;
+        if (d.splitOn && (!d.split || !d.split.length)) { const tr = d.tripId ? trip(d.tripId) : null; d.split = ['me', ...((tr && tr.members) || [])]; }
+        if (!d.splitOn) d.payer = 'me';
+        if (d.splitOn && cat(d.categoryId).ext) d.categoryId = 'food';
+        draw();
+      } else if (ds.sp) {
+        const s = new Set(d.split && d.split.length ? d.split : ['me']);
+        s.has(ds.sp) ? s.delete(ds.sp) : s.add(ds.sp);
+        d.split = s.size ? [...s] : ['me'];
+        if (d.payer !== 'me' && !d.split.includes(d.payer) && d.split.length) { /* payer may sit out */ }
+        draw();
+      } else if (ds.payer) { d.payer = ds.payer; draw(); }
+      else if (ds.smode) {
+        d.splitMode = ds.smode;
+        if (ds.smode === 'exact') { const sh = splitShares({ ...d, splitMode: 'equal' }); for (const k of Object.keys(sh)) if (!d.exact[k]) d.exact[k] = String(r2(sh[k]) || ''); }
         draw();
       } else if (ds.cat) {
         d.categoryId = ds.cat;
         if (cat(ds.cat).needsPerson && !d.personId) d.personId = people().find((p) => p.relation === 'Friend')?.id || people()[0]?.id || null;
         if (d.type === 'expense' && !cat(ds.cat).needsPerson) d.personId = null;
+        if (cat(ds.cat).ext) { d.splitOn = false; d.payer = 'me'; }
         draw();
       } else if (ds.mode) { d.mode = ds.mode; draw(); }
       else if (ds.pp !== undefined) { d.personId = ds.pp || null; draw(); }
-      else if (ds.trip !== undefined) { d.tripId = ds.trip || null; d.split = null; draw(); }
-      else if (ds.split) {
-        const s = new Set(d.split && d.split.length ? d.split : ['me']);
-        s.has(ds.split) ? s.delete(ds.split) : s.add(ds.split);
-        d.split = s.size ? [...s] : ['me']; draw();
-      } else if ('splitall' in ds) { d.split = ['me', ...(trip(d.tripId)?.members || [])]; draw(); }
-      else if ('newperson' in ds) openPersonEdit(null, (id) => { d.personId = id; draw(); });
+      else if (ds.trip !== undefined) {
+        d.tripId = ds.trip || null;
+        if (d.splitOn && d.tripId) { const tr = trip(d.tripId); d.split = ['me', ...(tr.members || [])]; }
+        draw();
+      } else if ('newperson' in ds) openPersonEdit(null, (id) => { if (ds.newperson === 'split') d.split = [...(d.split || ['me']), id]; else d.personId = id; draw(); });
       else if ('swapwallets' in ds) { [d.walletId, d.toWalletId] = [d.toWalletId, d.walletId]; draw(); }
       else if ('voiceIn' in ds) { close(); setTimeout(() => openVoice(), 300); }
       else if ('deltx' in ds) {
@@ -184,6 +265,12 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
       } else if ('save' in ds) {
         if (!(parseFloat(d.amount) > 0)) return shake($('#amt', inner));
         if (cat(d.categoryId).needsPerson && !d.personId) { toast('Pick who this is with'); return; }
+        if (d.type === 'expense' && d.splitOn) {
+          const sm = splitSummary(d);
+          if (sm.warn) { toast(`The amounts don’t match the bill: ${sm.text}`); return; }
+          const ids = d.split || ['me'];
+          if (ids.length === 1 && ids[0] === 'me' && d.payer === 'me') { toast('Pick at least one friend to split with'); return; }
+        }
         commitTxn(d, { editing });
         close(); bus.render();
       }
@@ -191,43 +278,11 @@ export function openAdd({ type = 'expense', tx = null, personId = null, tripId =
   });
 }
 
-// ---------- friend paid (shared trip cost, no wallet effect) ----------
+// A friend paid for something shared (kept for trip screens)
 export function openFriendPaid({ tripId = null, tx = null } = {}) {
-  const editing = !!tx;
-  const tr0 = trip(tripId || tx?.tripId);
-  const members = (tr0?.members || []).filter((m) => person(m));
-  const d = tx ? { ...tx } : { type: 'tripshare', amount: '', date: todayISO(), time: nowTime(), note: '', tripId: tr0?.id, personId: members[0], categoryId: 'food', split: ['me', ...members] };
-  const body = () => {
-    const n = (d.split || []).length || 1;
-    return `${amountInput(d.amount)}
-    <div class="field"><span>Paid by</span><div class="chips tight">${members.map((m) => { const p = person(m); return `<button class="chip person-chip ${d.personId === m ? 'on' : ''}" data-payer="${m}" style="--c:${p.color}"><span class="pdot">${esc(p.name[0])}</span>${esc(p.name)}</button>`; }).join('')}</div></div>
-    <div class="field"><span>Category</span><div class="cats">${categories('expense').filter((c) => !c.ext).map((x) => `<button class="cat ${d.categoryId === x.id ? 'on' : ''}" data-cat="${x.id}" style="--c:${x.color}"><span>${x.icon}</span>${esc(x.name)}</button>`).join('')}</div></div>
-    <div class="field"><span>Split between</span><div class="chips tight"><button class="chip ${d.split.includes('me') ? 'on' : ''}" data-split="me">Me</button>${members.map((m) => { const p = person(m); return `<button class="chip person-chip ${d.split.includes(m) ? 'on' : ''}" data-split="${m}" style="--c:${p.color}"><span class="pdot">${esc(p.name[0])}</span>${esc(p.name)}</button>`; }).join('')}</div>
-    <p class="from-note">${d.split.includes('me') ? `Your share is ${money((+d.amount || 0) / n)}. You will owe ${esc(person(d.personId)?.name || 'them')} this.` : 'You are not part of this one, so you owe nothing.'} Your SBI and cash don't change.</p></div>
-    <div class="row2"><label class="field"><span>Date</span><input type="date" id="date" value="${d.date}" max="${todayISO()}"></label><label class="field"><span>Time</span><input type="time" id="time" value="${d.time || ''}"></label></div>
-    <label class="field"><span>Note</span><input id="note" value="${esc(d.note)}" placeholder="e.g. Hotel for 2 nights" maxlength="80"></label>`;
-  };
-  openSheet(sheetFrame(editing ? 'Edit shared expense' : `A friend paid${tr0 ? ` on ${esc(tr0.name)}` : ''}`, '', `${editing ? `<button class="btn danger-ghost" data-deltx aria-label="Delete">${icon('trash', 18)}</button>` : ''}<button class="btn primary wide transfer" data-save>${editing ? 'Save changes' : 'Add shared expense'}</button>`), (sheet, close) => {
-    const bodyEl = $('.sheet-body', sheet);
-    const capture = () => { d.amount = $('#amt', sheet).value; d.note = $('#note', sheet).value; d.date = $('#date', sheet).value || todayISO(); d.time = $('#time', sheet).value; };
-    const draw = () => { const st = bodyEl.scrollTop; bodyEl.innerHTML = body(); fitAmount(sheet); bodyEl.scrollTop = st; };
-    draw(); if (!editing) setTimeout(() => $('#amt', sheet)?.focus(), 260);
-    sheet.addEventListener('input', (e) => { cleanAmount(e); if (e.target.id === 'amt') fitAmount(sheet); });
-    sheet.addEventListener('click', (e) => {
-      const t = e.target.closest('button'); if (!t) return; const ds = t.dataset;
-      if (ds.payer || ds.cat || ds.split) capture();
-      if (ds.payer) { d.personId = ds.payer; draw(); }
-      else if (ds.cat) { d.categoryId = ds.cat; draw(); }
-      else if (ds.split) { const s = new Set(d.split); s.has(ds.split) ? s.delete(ds.split) : s.add(ds.split); d.split = s.size ? [...s] : ['me']; draw(); }
-      else if ('deltx' in ds) ask('Delete this shared expense?', 'Trip balances will update.', 'Delete').then((ok) => { if (ok) { store.deleteTxn(d.id); close(); toast('Deleted'); bus.render(); } });
-      else if ('save' in ds) {
-        capture();
-        if (!(parseFloat(d.amount) > 0)) return shake($('#amt', sheet));
-        if (!d.personId) return toast('Pick who paid');
-        commitTxn(d, { editing }); close(); bus.render();
-      }
-    });
-  });
+  if (tx) return openAdd({ tx });
+  const members = ((trip(tripId) || {}).members || []).filter((m) => person(m));
+  openAdd({ type: 'expense', tripId, split: true, splitWith: members, payer: members[0] || 'me' });
 }
 
 // ---------- people ----------
@@ -235,6 +290,8 @@ export function openPersonEdit(id, onSaved) {
   const p = id ? person(id) : { name: '', relation: 'Friend' };
   openSheet(sheetFrame(id ? 'Edit person' : 'Add a person', `<label class="field"><span>Name</span><input id="pname" value="${esc(p.name)}" placeholder="e.g. Ravi" maxlength="30"></label>
     <div class="field"><span>Relation</span>${chipRow(['Family', 'Friend', 'Relative', 'Roommate', 'Other'].map((r) => [r, r]), p.relation, 'rel')}</div>
+    <div class="row2 even"><label class="field"><span>WhatsApp number</span><input id="pphone" type="tel" inputmode="tel" value="${esc(p.phone || '')}" placeholder="Optional" autocomplete="off"></label><label class="field"><span>Their UPI ID</span><input id="pupi" value="${esc(p.upi || '')}" placeholder="name@okaxis" autocomplete="off" autocapitalize="none"></label></div>
+    <p class="from-note">Optional. Used to send payment reminders and to pay them back with one tap.</p>
     ${id ? `<div class="field"><span>Colour</span>${colorRow(p.color)}</div>` : ''}`,
   `${id ? `<button class="btn danger-ghost" data-delp aria-label="Remove">${icon('trash', 18)}</button>` : ''}<button class="btn primary wide" data-savep>${id ? 'Save changes' : 'Add person'}</button>`), (sheet, close) => {
     let rel = p.relation, color = p.color;
@@ -246,7 +303,9 @@ export function openPersonEdit(id, onSaved) {
       if ('savep' in t.dataset) {
         const name = $('#pname', sheet).value.trim();
         if (!name) return shake($('#pname', sheet));
-        const rec = store.savePerson({ ...(id ? { id, color } : {}), name, relation: rel });
+        const phone = $('#pphone', sheet).value.replace(/[^\d+]/g, ''), upi = $('#pupi', sheet).value.trim();
+        if (upi && !/^[\w.\-]{2,}@[a-z]{2,}$/i.test(upi)) { toast('That UPI ID doesn’t look right. It should look like name@okaxis'); return; }
+        const rec = store.savePerson({ ...(id ? { id, color } : {}), name, relation: rel, phone, upi });
         close(); toast(id ? 'Changes saved' : `${name} added`);
         if (onSaved) onSaved(rec.id); else bus.render();
       }
@@ -254,6 +313,44 @@ export function openPersonEdit(id, onSaved) {
     });
   });
 }
+
+// ---------- remind & pay back ----------
+export function remindText(pid) {
+  const p = person(pid);
+  const l = ledger(pid);
+  const myUpi = (store.get().settings.upi || '').trim();
+  const items = txns().filter((t) => t.type === 'expense' && t.split && t.split.includes(pid) && !isExtCat(t)).slice(0, 4)
+    .map((t) => `• ${txTitle(t)} (${dayLabel(t.date)}): ${money(shareOf(t, pid), { round: true })}`);
+  return [`Hi ${p.name}! Quick reminder: ${money(l.net, { round: true })} is pending from our shared expenses 🙂`, items.length ? items.join('\n') : '', myUpi ? `You can pay me on UPI: ${myUpi}` : '', 'Thanks!'].filter(Boolean).join('\n\n');
+}
+export async function remindPerson(pid) {
+  const p = person(pid);
+  const text = remindText(pid);
+  const phone = (p.phone || '').replace(/\D/g, '');
+  if (phone) { location.href = `https://wa.me/${phone.length === 10 ? '91' + phone : phone}?text=${encodeURIComponent(text)}`; return; }
+  if (navigator.share) { try { await navigator.share({ text }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  location.href = `https://wa.me/?text=${encodeURIComponent(text)}`;
+}
+let pendingUpi = null;
+export function payByUpi(pid) {
+  const p = person(pid);
+  const amt = r2(-ledger(pid).net);
+  if (!p.upi) { toast(`Add ${p.name}’s UPI ID first (tap edit on their page)`); return; }
+  pendingUpi = { pid, amt, at: Date.now() };
+  const q = new URLSearchParams({ pa: p.upi, pn: p.name, am: amt.toFixed(2), cu: 'INR', tn: 'Kharcha settle-up' });
+  location.href = `upi://pay?${q.toString()}`;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !pendingUpi) return;
+  const { pid, amt, at } = pendingUpi; pendingUpi = null;
+  if (Date.now() - at < 1500) return;
+  const p = person(pid);
+  ask('Did the payment go through?', `If you paid ${money(amt)} to ${p.name}, Kharcha will record it and clear what you owe.`, 'Yes, record it', false).then((ok) => {
+    if (!ok) return;
+    commitTxn({ type: 'expense', amount: amt, date: todayISO(), categoryId: 'settle-out', personId: pid, mode: 'upi', note: '' });
+    bus.render();
+  });
+});
 
 // ---------- trips ----------
 export function openTripEdit(id) {
@@ -292,8 +389,9 @@ export function openTripEdit(id) {
 }
 export function settle(tripId, pid, v) {
   const p = person(pid);
-  if (v > 0) openAdd({ draft: { type: 'income', amount: Math.round(v * 100) / 100, date: todayISO(), categoryId: 'settle-in', personId: pid, tripId, mode: ui.lastMode.income, note: '' } });
-  else openAdd({ draft: { type: 'expense', amount: Math.round(-v * 100) / 100, date: todayISO(), categoryId: 'settle-out', personId: pid, tripId, mode: ui.lastMode.expense, note: '' } });
+  tripId = tripId || null;
+  if (v > 0) openAdd({ draft: { type: 'income', amount: r2(v), date: todayISO(), categoryId: 'settle-in', personId: pid, tripId, mode: ui.lastMode.income, note: '' } });
+  else openAdd({ draft: { type: 'expense', amount: r2(-v), date: todayISO(), categoryId: 'settle-out', personId: pid, tripId, mode: ui.lastMode.expense, note: '' } });
   void p;
 }
 
@@ -530,8 +628,8 @@ export function answer(q) {
   }
   if (q.type === 'owe') {
     const list = q.personId ? [person(q.personId)] : people();
-    const parts = list.map((p) => ({ p, l: ledger(p.id) })).filter((x) => x.l.iOwe || x.l.owesMe).map(({ p, l }) => [l.iOwe ? `you owe ${p.name} ${money(l.iOwe, { round: true })}` : '', l.owesMe ? `${p.name} owes you ${money(l.owesMe, { round: true })}` : ''].filter(Boolean).join(' and '));
-    return parts.length ? parts.join('. ').replace(/^./, (c) => c.toUpperCase()) + '.' : 'No loans pending. You are all square.';
+    const parts = list.map((p) => ({ p, l: ledger(p.id) })).filter((x) => x.l.net).map(({ p, l }) => (l.net < 0 ? `you owe ${p.name} ${money(-l.net, { round: true })}` : `${p.name} owes you ${money(l.net, { round: true })}`));
+    return parts.length ? parts.join('. ').replace(/^./, (c) => c.toUpperCase()) + '.' : 'Nothing pending. You are all square with everyone.';
   }
   if (q.type === 'budget') {
     const bs = budgetStatus(todayISO().slice(0, 7));
@@ -542,6 +640,11 @@ export function answer(q) {
   return 'Sorry, I did not get that.';
 }
 function draftSummary(d) {
+  if (d.type === 'expense' && d.splitOn) {
+    const c = cat(d.categoryId);
+    const ids = d.split || ['me'];
+    return { title: `Split ${money(d.amount)} ${ids.length} ways`, sub: [c.name, d.note, splitSummary({ ...d, splitMode: 'equal' }).text.replace(/ Your SBI and cash don’t change\./, '')].filter(Boolean).join(', '), cls: d.payer && d.payer !== 'me' ? 'transfer' : 'expense', icon: c.icon };
+  }
   if (d.type === 'transfer') return { title: `Move ${money(d.amount)}`, sub: `${wallet(d.walletId).name} → ${wallet(d.toWalletId).name}`, cls: 'transfer' };
   const c = cat(d.categoryId);
   if (d.type === 'income') return { title: `Received ${money(d.amount)}`, sub: [person(d.personId)?.name ? `from ${person(d.personId).name}` : '', c.name, INCOME_MODES[d.mode]?.label, d.date !== todayISO() ? dayLabel(d.date) : ''].filter(Boolean).join(', '), cls: 'income', icon: c.icon };
@@ -554,7 +657,7 @@ export function openVoice() {
     <p class="v-heard" id="v-heard"></p>
     <div id="v-result"></div>
     <form class="v-type" id="v-form"><input id="v-text" placeholder="Or type, e.g. spent 120 on auto" autocomplete="off" enterkeyhint="go"><button class="icon-btn" type="submit" aria-label="Run command">${icon('chevR', 20)}</button></form>
-    <div class="v-examples"><p class="lbl">Try saying</p>${['Spent 250 on biryani with cash', 'Dad sent me 3000', 'Withdrew 2000 from ATM', 'Lent 500 to Ravi', 'How much did I spend this week?', 'What is my balance?', 'How is my budget?', 'Open trips'].map((x) => `<button class="chip" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+    <div class="v-examples"><p class="lbl">Try saying</p>${['Spent 250 on biryani with cash', 'Dad sent me 3000', 'Withdrew 2000 from ATM', 'Split 900 dinner with Ravi and Kiran', 'Lent 500 to Ravi', 'How much did I spend this week?', 'What is my balance?', 'How is my budget?', 'Open trips'].map((x) => `<button class="chip" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>
   </div>`, ''), (sheet, close) => {
     $('.sheet-foot', sheet).remove();
     let stop = null;

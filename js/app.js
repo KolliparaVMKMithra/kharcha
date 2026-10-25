@@ -1,9 +1,10 @@
-import { store, txns, cat, person, wallet, trips, processRecurring, inMonth, sumBy, spent, received, spendAmt, incomeAmt, MODES } from './store.js';
+import { store, txns, cat, person, wallet, trips, ledger, processRecurring, inMonth, sumBy, spent, received, spendAmt, incomeAmt, MODES } from './store.js';
 import { todayISO, shiftMonth, monthLabel, toast } from './ui.js';
 import { $, bus, ui, txTitle, modeLabel } from './shared.js';
 import * as V from './views.js';
 import * as S from './sheets.js';
 import * as Sync from './sync.js';
+import * as Push from './push.js';
 
 const app = $('#app');
 
@@ -20,7 +21,7 @@ function applyTheme() {
 const ROUTES = {
   home: V.Home, activity: V.Activity, insights: V.Insights, more: V.More, people: V.People, person: V.PersonView,
   trips: V.Trips, trip: V.TripView, budgets: V.Budgets, goals: V.Goals, bills: V.Bills, categories: V.Categories,
-  report: V.Report, settings: V.Settings, sync: V.SyncView,
+  report: V.Report, settings: V.Settings, sync: V.SyncView, reminders: V.Reminders,
 };
 const TAB_OF = { home: 'home', activity: 'activity', insights: 'insights', report: 'insights' };
 function route() { const [name, arg] = (location.hash.replace(/^#\/?/, '') || 'home').split('/'); return { name, arg }; }
@@ -133,12 +134,22 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------- events ----------
-const ACTIONS = '[data-add],[data-tx],[data-mshift],[data-filter],[data-addperson],[data-editperson],[data-theme-set],[data-act],[data-voice],[data-actview],[data-day],[data-newtrip],[data-edittrip],[data-friendpaid],[data-settle],[data-archivetrip],[data-editbudget],[data-editgoal],[data-goaladd],[data-goaltake],[data-editbill],[data-paybill],[data-editcat],[data-repay],[data-gotback],[data-lend]';
+const ACTIONS = '[data-split],[data-remind],[data-payupi],[data-settleperson],[data-notify],[data-copy],[data-add],[data-tx],[data-mshift],[data-filter],[data-addperson],[data-editperson],[data-theme-set],[data-act],[data-voice],[data-actview],[data-day],[data-newtrip],[data-edittrip],[data-friendpaid],[data-settle],[data-archivetrip],[data-editbudget],[data-editgoal],[data-goaladd],[data-goaltake],[data-editbill],[data-paybill],[data-editcat],[data-repay],[data-gotback],[data-lend]';
 document.addEventListener('click', async (e) => {
   const t = e.target.closest(ACTIONS);
   if (!t || t.closest('.sheet') || t.closest('.lock')) return;
   const ds = t.dataset;
-  if (ds.add) S.openAdd({ type: ds.add, personId: ds.person || null, tripId: ds.trip || null });
+  if ('split' in ds) S.openAdd({ type: 'expense', split: true, splitWith: ds.with ? [ds.with] : [] });
+  else if (ds.remind) S.remindPerson(ds.remind);
+  else if (ds.payupi) S.payByUpi(ds.payupi);
+  else if (ds.settleperson) S.settle(null, ds.settleperson, ledger(ds.settleperson).net);
+  else if (ds.notify) { store.setSetting('notify', { ...Push.prefs(), [ds.notify]: !Push.prefs()[ds.notify] }); Push.pushPrefs(); render(); }
+  else if (ds.copy) {
+    const el = document.getElementById(ds.copy);
+    try { await navigator.clipboard.writeText(el.textContent); toast('Copied'); }
+    catch (er) { const r = document.createRange(); r.selectNodeContents(el); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast('Selected. Copy it from the menu.'); }
+  }
+  else if (ds.add) S.openAdd({ type: ds.add, personId: ds.person || null, tripId: ds.trip || null });
   else if (ds.tx) S.openAdd({ tx: txns().find((x) => x.id === ds.tx) });
   else if (ds.mshift) { const [k, n] = ds.mshift.split(':'); ui[k] = shiftMonth(ui[k], +n); if (k === 'month') ui.day = null; render(); }
   else if (ds.filter) { ui.filter = ds.filter; render(); }
@@ -171,6 +182,18 @@ document.addEventListener('click', async (e) => {
     else if (a === 'xlsx') exportXLSX();
     else if (a === 'pdf') { toast('Pick “Save as PDF” as the printer'); setTimeout(() => window.print(), 500); }
     else if (a === 'reset') { if (await S.ask('Erase all data?', 'Every transaction, person, trip and balance on this phone will be deleted. Download a backup first if you might need it.', 'Erase everything')) { store.reset(); location.hash = '#/home'; render(); } }
+    else if (a === 'notif-on') {
+      const p = await Push.enable();
+      toast(p === 'granted' ? (Push.serverOn() ? 'Reminders are on' : 'Notifications are on') : p === 'denied' ? 'Notifications were blocked. See the steps on this screen to allow them.' : 'Notifications weren’t turned on');
+      render();
+    }
+    else if (a === 'notif-off') { if (await S.ask('Turn off all notifications?', 'You won’t get daily, bill or weekly reminders on this device.', 'Turn off')) { await Push.disable(); toast('Notifications are off'); render(); } }
+    else if (a === 'notif-test') { try { await Push.testLocal(); } catch (er) { toast('Couldn’t show a notification. Check that notifications are allowed.'); } }
+    else if (a === 'push-connect') { t.disabled = true; const ok = await Push.connectServer(); toast(ok ? 'This phone is connected to the reminder server' : 'Not connected yet. See the message on this screen.'); render(); }
+    else if (a === 'push-test') {
+      try { const r = await Push.testServer(); toast(r && r.sent ? 'Sent. It should appear in a few seconds.' : 'The server found no devices. Tap Connect this phone again.'); }
+      catch (er) { toast(/not found|404/i.test(er.message) ? 'The kharcha-reminders function isn’t deployed yet' : `Server error: ${er.message}`); }
+    }
     else if (a === 'pin-set') S.openPinSetup('set');
     else if (a === 'pin-change') S.openPinSetup('change');
     else if (a === 'pin-off') S.openPinSetup('off');
@@ -193,6 +216,12 @@ document.addEventListener('input', (e) => {
 document.addEventListener('change', (e) => {
   if (e.target.closest('.sheet')) return;
   if (e.target.id === 'set-name') { store.setSetting('name', e.target.value.trim()); toast('Name saved'); }
+  if (e.target.id === 'set-upi') {
+    const v = e.target.value.trim();
+    if (v && !/^[\w.\-]{2,}@[a-z]{2,}$/i.test(v)) { toast('That UPI ID doesn’t look right. It should look like name@oksbi'); return; }
+    store.setSetting('upi', v); toast('UPI ID saved');
+  }
+  if (e.target.id === 'notify-time' && e.target.value) { store.setSetting('notify', { ...Push.prefs(), dailyTime: e.target.value }); Push.pushPrefs(); toast(`Daily reminder set for ${e.target.value}`); }
   if (e.target.dataset.opening) { store.setOpening(e.target.dataset.opening, parseFloat(e.target.value.replace(/[^\d.]/g, '')) || 0); toast('Balance updated'); }
   if (e.target.id === 'restore-file' && e.target.files[0]) {
     e.target.files[0].text().then(async (txt) => {
@@ -259,5 +288,11 @@ render();
 lock();
 if (added) toast(`${added} bill${added > 1 ? 's were' : ' was'} added automatically`);
 Sync.startAutoSync();
-if (location.search.includes('voice')) setTimeout(() => S.openVoice(), 400);
-if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js', { type: 'module' }).catch(() => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+Push.init();
+// Shortcuts and notification taps: ?voice or ?add=expense
+const qs = new URLSearchParams(location.search);
+if (qs.has('voice')) setTimeout(() => S.openVoice(), 400);
+else if (qs.get('add') && store.get().settings.onboarded) setTimeout(() => S.openAdd({ type: qs.get('add') }), 400);
+if (qs.has('voice') || qs.has('add')) history.replaceState(null, '', location.pathname + location.hash);
+navigator.serviceWorker?.addEventListener('message', (e) => { if (e.data && e.data.type === 'open' && e.data.url) { const u = new URL(e.data.url, location.href); if (u.searchParams.get('add')) S.openAdd({ type: u.searchParams.get('add') }); else location.hash = u.hash || '#/home'; } });

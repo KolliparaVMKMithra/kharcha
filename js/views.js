@@ -1,7 +1,8 @@
-import { store, txns, people, cat, person, wallet, trips, trip, goals, recurring, categories, balances, inMonth, sumBy, spent, received, spendAmt, incomeAmt, ledger, tripStats, budgetStatus, MODES } from './store.js';
+import { store, txns, people, cat, person, wallet, trips, trip, goals, recurring, categories, balances, inMonth, sumBy, spent, received, spendAmt, incomeAmt, ledger, allNets, tripStats, budgetStatus, MODES } from './store.js';
 import { esc, money, compact, todayISO, toISO, parseISO, monthLabel, shiftMonth, dayLabel, greeting, icon, donut, bars, line, ring, pctColor } from './ui.js';
 import { ui, txRow, txTitle, txSub, monthSwitch, empty, pageHead, modeLabel } from './shared.js';
-import { config as syncConfig, status as syncStatus, SETUP_SQL } from './sync.js';
+import { config as syncConfig, status as syncStatus, SETUP_SQL, pushSql } from './sync.js';
+import * as Push from './push.js';
 import { speechSupported } from './voice.js';
 
 const today = () => todayISO();
@@ -38,8 +39,8 @@ export function Home() {
   const bs = budgetStatus(curYM());
   const due = recurring().filter((r) => !r.auto && daysUntil(r.next) <= 3).slice(0, 3);
   const live = trips().filter((t) => !t.archived && t.start <= today() && (!t.end || t.end >= today()));
-  const loans = people().map((p) => ({ p, l: ledger(p.id) }));
-  const iOwe = loans.reduce((a, x) => a + x.l.iOwe, 0), owesMe = loans.reduce((a, x) => a + x.l.owesMe, 0);
+  const nets = Object.values(allNets());
+  const iOwe = nets.reduce((a, v) => a + (v < 0 ? -v : 0), 0), owesMe = nets.reduce((a, v) => a + (v > 0 ? v : 0), 0);
 
   return `
   <header class="top">
@@ -64,7 +65,7 @@ export function Home() {
   <div class="quick">
     <button data-add="expense"><span class="q-ic out">${icon('up', 20)}</span>Spent</button>
     <button data-add="income"><span class="q-ic in">${icon('down', 20)}</span>Received</button>
-    <button data-add="transfer"><span class="q-ic mv">${icon('swap', 20)}</span>Move</button>
+    <button data-split><span class="q-ic mv">${icon('users', 20)}</span>Split</button>
     <button data-voice><span class="q-ic vo">${icon('mic', 20)}</span>Speak</button>
   </div>
 
@@ -86,8 +87,9 @@ export function Home() {
   ${live.map((t) => { const st = tripStats(t.id); return `<a class="card trip-mini" href="#/trip/${t.id}" style="--c:${t.color || '#0F8FA0'}"><span class="tm-emoji">${t.emoji || '🧳'}</span><span class="row-main"><span class="row-t">${esc(t.name)} is on</span><span class="row-s">Your share ${money(st.mine, { round: true })}${t.budget ? ` of ${money(t.budget, { round: true })} budget` : ''}</span>${t.budget ? meter(st.mine / t.budget) : ''}</span>${icon('chevR', 18)}</a>`; }).join('')}
 
   ${iOwe || owesMe ? `<a class="card loans-mini" href="#/people">
+    <div><span class="lbl">Friends owe you</span><span class="v in">${money(owesMe, { round: true })}</span></div>
     <div><span class="lbl">You owe</span><span class="v out">${money(iOwe, { round: true })}</span></div>
-    <div><span class="lbl">Owed to you</span><span class="v in">${money(owesMe, { round: true })}</span></div>${icon('chevR', 18)}
+    ${icon('chevR', 18)}
   </a>` : ''}
 
   <section class="card">
@@ -227,51 +229,71 @@ export function Insights() {
 // ---------------- PEOPLE ----------------
 export function People() {
   const inc = txns().filter((t) => incomeAmt(t) > 0);
+  const nets = allNets();
   const rows = people().map((p) => {
     const mine = inc.filter((t) => t.personId === p.id);
-    const l = ledger(p.id);
-    return { p, l, all: mine.reduce((a, t) => a + t.amount, 0), month: mine.filter((t) => t.date.startsWith(curYM())).reduce((a, t) => a + t.amount, 0), n: mine.length, last: mine[0]?.date };
+    return { p, net: nets[p.id] || 0, all: mine.reduce((a, t) => a + t.amount, 0), month: mine.filter((t) => t.date.startsWith(curYM())).reduce((a, t) => a + t.amount, 0), n: mine.length, last: mine[0]?.date };
   }).sort((a, b) => b.all - a.all);
   const grand = rows.reduce((a, r) => a + r.all, 0);
+  const owed = rows.filter((r) => r.net > 0).reduce((a, r) => a + r.net, 0);
+  const owe = rows.filter((r) => r.net < 0).reduce((a, r) => a - r.net, 0);
+  const pending = rows.filter((r) => r.net).sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
   return `
-  <header class="top simple"><a class="icon-btn" href="#/more" aria-label="Back">${icon('chevL')}</a><h1 class="title">People</h1><button class="btn ghost sm" data-addperson>${icon('plus', 18)} Add</button></header>
-  <section class="card people-total">
+  <header class="top simple"><a class="icon-btn" href="#/more" aria-label="Back">${icon('chevL')}</a><h1 class="title">People</h1><button class="icon-btn" data-addperson aria-label="Add a person">${icon('plus', 20)}</button></header>
+  <button class="card split-cta" data-split>${icon('users', 22)}<span class="row-main"><span class="row-t">Split a bill</span><span class="row-s">Dinner, movie, rent. Split it and track who owes whom.</span></span>${icon('chevR', 18)}</button>
+  ${pending.length ? `<section class="card">
+    <div class="owe-sum"><div><span class="lbl">Friends owe you</span><span class="v in">${money(owed, { round: true })}</span></div><div><span class="lbl">You owe</span><span class="v out">${money(owe, { round: true })}</span></div></div>
+    <ul class="bal-list">${pending.map((r) => `<li>${personTile(r.p)}<a class="row-main" href="#/person/${r.p.id}"><span class="row-t">${esc(r.p.name)}</span><span class="row-s ${r.net > 0 ? 'in-t' : 'warn-t'}">${r.net > 0 ? `Owes you ${money(r.net, { round: true })}` : `You owe ${money(-r.net, { round: true })}`}</span></a>${r.net > 0 ? `<button class="btn sm ghost" data-remind="${r.p.id}">Remind</button>` : r.p.upi ? `<button class="btn sm danger-solid" data-payupi="${r.p.id}">Pay</button>` : `<button class="btn sm ghost" data-settleperson="${r.p.id}">Settle</button>`}</li>`).join('')}</ul>
+  </section>` : ''}
+  ${grand ? `<section class="card people-total">
     <span class="lbl">Received from everyone</span><span class="big">${money(grand, { round: true })}</span>
-    ${grand ? `<div class="stack">${rows.filter((r) => r.all).map((r) => `<span style="width:${(r.all / grand) * 100}%;background:${r.p.color}" title="${esc(r.p.name)}"></span>`).join('')}</div>` : ''}
-  </section>
+    <div class="stack">${rows.filter((r) => r.all).map((r) => `<span style="width:${(r.all / grand) * 100}%;background:${r.p.color}" title="${esc(r.p.name)}"></span>`).join('')}</div>
+  </section>` : ''}
   <div class="people">${rows.map((r) => `
     <a class="card person-card" href="#/person/${r.p.id}">
       ${personTile(r.p, 'lg')}
       <span class="pc-main"><span class="pc-n">${esc(r.p.name)}</span><span class="pc-s">${r.n ? `${r.n} time${r.n > 1 ? 's' : ''}, last ${dayLabel(r.last).toLowerCase()}` : 'Nothing received yet'}</span>
-      ${r.l.iOwe || r.l.owesMe ? `<span class="pc-tags">${r.l.iOwe ? `<span class="tag out">You owe ${money(r.l.iOwe, { round: true })}</span>` : ''}${r.l.owesMe ? `<span class="tag in">Owes you ${money(r.l.owesMe, { round: true })}</span>` : ''}</span>` : ''}</span>
+      ${r.net ? `<span class="pc-tags">${r.net < 0 ? `<span class="tag out">You owe ${money(-r.net, { round: true })}</span>` : `<span class="tag in">Owes you ${money(r.net, { round: true })}</span>`}</span>` : ''}</span>
       <span class="pc-v"><strong>${money(r.all, { round: true })}</strong><span>${r.month ? `${money(r.month, { round: true })} this month` : ''}</span></span>
     </a>`).join('')}</div>
-  <p class="hint">When a friend gives you money, mark it as a loan to track what you owe. Use “Lent to someone” when you give money out.</p>`;
+  <p class="hint">Balances include splits, loans and settle-ups. Add a friend’s WhatsApp number and UPI ID (tap them, then edit) to remind them or pay them back in one tap.</p>`;
 }
 
 export function PersonView(id) {
   const p = person(id);
   if (!p || p.deleted) return null;
-  const all = txns().filter((t) => t.personId === id);
-  const inc = all.filter((t) => incomeAmt(t) > 0);
+  const all = txns().filter((t) => t.personId === id || (t.split && t.split.includes(id)));
+  const inc = all.filter((t) => t.personId === id && incomeAmt(t) > 0);
   const total = inc.reduce((a, t) => a + t.amount, 0);
   const six = [...Array(6)].map((_, i) => shiftMonth(curYM(), i - 5)).map((k) => ({ label: monthLabel(k, false).split(' ')[0], value: inc.filter((t) => t.date.startsWith(k)).reduce((a, t) => a + t.amount, 0) }));
   const cash = inc.filter((t) => t.mode === 'cash').reduce((a, t) => a + t.amount, 0);
   const l = ledger(id);
+  const lines = [
+    [l.splitOwed, 'Their share of bills you paid', 'in'], [l.splitOwe, 'Your share of bills they paid', 'out'],
+    [l.lent, 'You lent them', 'in'], [l.gotBack, 'They paid you back', 'out'],
+    [l.borrowed, 'You borrowed', 'out'], [l.repaid, 'You paid back', 'in'],
+    [l.settledOut, 'You settled up (paid them)', 'in'], [l.settledIn, 'They settled up (paid you)', 'out'],
+  ].filter(([v]) => v > 0.004);
+  const head = l.net > 0 ? `${esc(p.name)} owes you` : l.net < 0 ? `You owe ${esc(p.name)}` : 'All settled';
   return `
   <header class="top simple"><a class="icon-btn" href="#/people" aria-label="Back">${icon('chevL')}</a><h1 class="title">${esc(p.name)}</h1><button class="icon-btn" data-editperson="${p.id}" aria-label="Edit">${icon('edit', 20)}</button></header>
-  <section class="card person-hero" style="--c:${p.color}">
+  ${lines.length || l.net ? `<section class="card bal-card ${l.net > 0 ? 'pos' : l.net < 0 ? 'neg' : 'zero'}">
+    <span class="lbl">${head}</span><span class="big">${l.net ? money(Math.abs(l.net)) : `${icon('check', 26)}`}</span>
+    ${lines.length ? `<ul class="bal-lines">${lines.map(([v, t, k]) => `<li><span>${t}</span><span class="${k}-t">${k === 'in' ? '+' : '−'}${money(v, { round: true })}</span></li>`).join('')}</ul>` : ''}
+    ${l.net > 0 ? `<div class="two-btn"><button class="btn primary wide" data-remind="${id}">${icon('share', 18)} Remind ${esc(p.name)}</button><button class="btn ghost" data-settleperson="${id}">Got paid</button></div>`
+      : l.net < 0 ? `<div class="two-btn">${p.upi ? `<button class="btn danger-solid wide" data-payupi="${id}">Pay ${money(-l.net, { round: true })} by UPI</button>` : ''}<button class="btn ${p.upi ? 'ghost' : 'danger-solid wide'}" data-settleperson="${id}">${p.upi ? 'Paid already' : `Record I paid ${money(-l.net, { round: true })}`}</button></div>${!p.upi ? `<p class="from-note">Add ${esc(p.name)}’s UPI ID (tap ${icon('edit', 14)}) to pay in one tap.</p>` : ''}` : ''}
+  </section>` : ''}
+  <div class="three-btn">
+    <button class="btn ghost" data-split data-with="${id}">${icon('users', 18)} Split a bill</button>
+    <button class="btn ghost" data-add="income" data-person="${p.id}">${icon('down', 18)} Received</button>
+    <button class="btn ghost" data-lend="${p.id}">${icon('handshake', 18)} Lend</button>
+  </div>
+  ${total ? `<section class="card person-hero" style="--c:${p.color}">
     ${personTile(p, 'xl')}
-    <span class="lbl">Total received</span><span class="big">${money(total)}</span>
+    <span class="lbl">Total received from ${esc(p.name)}</span><span class="big">${money(total)}</span>
     <div class="ph-stats"><div><span>${inc.length}</span>times</div><div><span>${compact(cash)}</span>as cash</div><div><span>${compact(total - cash)}</span>online</div></div>
   </section>
-  ${l.borrowed || l.lent ? `<section class="card loan-card">
-    <div class="mc-head"><h2>Loans</h2></div>
-    ${l.borrowed ? `<div class="loan-row"><span class="row-main"><span class="row-t">You borrowed ${money(l.borrowed, { round: true })}</span><span class="row-s">Repaid ${money(l.repaid, { round: true })}</span></span>${l.iOwe ? `<button class="btn sm danger-solid" data-repay="${id}" data-amt="${l.iOwe}">Repay ${money(l.iOwe, { round: true })}</button>` : `<span class="tag in">${icon('check', 14)} Cleared</span>`}</div>` : ''}
-    ${l.lent ? `<div class="loan-row"><span class="row-main"><span class="row-t">You lent ${money(l.lent, { round: true })}</span><span class="row-s">Got back ${money(l.gotBack, { round: true })}</span></span>${l.owesMe ? `<button class="btn sm primary income" data-gotback="${id}" data-amt="${l.owesMe}">Got ${money(l.owesMe, { round: true })} back</button>` : `<span class="tag in">${icon('check', 14)} Cleared</span>`}</div>` : ''}
-  </section>` : ''}
-  <section class="card"><div class="mc-head"><h2>By month</h2></div>${bars(six, { color: p.color, highlight: 5 })}</section>
-  <div class="two-btn"><button class="btn primary income wide" data-add="income" data-person="${p.id}">${icon('down', 18)} Received from ${esc(p.name)}</button><button class="btn ghost" data-lend="${p.id}">${icon('handshake', 18)} Lend</button></div>
+  <section class="card"><div class="mc-head"><h2>Money received by month</h2></div>${bars(six, { color: p.color, highlight: 5 })}</section>` : ''}
   <section class="card list-card"><div class="mc-head"><h2>History</h2></div>${all.length ? `<div class="rows">${all.map(txRow).join('')}</div>` : `<p class="muted pad">Nothing recorded with ${esc(p.name)} yet.</p>`}</section>`;
 }
 
@@ -279,7 +301,7 @@ export function PersonView(id) {
 export function More() {
   const st = syncConfig();
   const tiles = [
-    ['people', 'users', 'People', `${people().length} ${people().length === 1 ? 'person' : 'people'}`, '#2B6CB0'],
+    ['people', 'users', 'People & splits', (() => { const n = Object.values(allNets()).filter(Boolean).length; return n ? `${n} pending` : `${people().length} ${people().length === 1 ? 'person' : 'people'}`; })(), '#2B6CB0'],
     ['trips', 'map', 'Trips', `${trips().filter((t) => !t.archived).length} active`, '#0F8FA0'],
     ['budgets', 'target', 'Budgets', budgetStatus(curYM()).overall ? 'This month' : 'Not set', '#E04F64'],
     ['goals', 'sparkle', 'Savings goals', `${goals().length} goal${goals().length === 1 ? '' : 's'}`, '#22A06B'],
@@ -290,6 +312,7 @@ export function More() {
   <header class="top simple"><h1 class="title">More</h1></header>
   <div class="more-grid">${tiles.map(([r, i, t, s, c]) => `<a class="card more-tile" href="#/${r}" style="--c:${c}"><span class="mt-ic">${icon(i, 22)}</span><span class="mt-t">${t}</span><span class="mt-s">${s}</span></a>`).join('')}</div>
   <section class="card more-list">
+    <a class="ml-row" href="#/reminders">${icon('bell', 20)}<span><strong>Reminders</strong><span>${Push.permission() === 'granted' ? 'Notifications are on' : 'Daily nudge, bills due, weekly summary'}</span></span>${icon('chevR', 18)}</a>
     <button class="ml-row" data-voice>${icon('mic', 20)}<span><strong>Voice commands</strong><span>Say “spent 200 on lunch” or “how much did I spend this week”</span></span>${icon('chevR', 18)}</button>
     <a class="ml-row" href="#/sync">${icon('cloud', 20)}<span><strong>Sync</strong><span>${st.signedIn ? `On, as ${esc(st.email)}` : 'Use the same data on phone and laptop'}</span></span>${icon('chevR', 18)}</a>
     <a class="ml-row" href="#/categories">${icon('grid', 20)}<span><strong>Categories</strong><span>Add your own categories</span></span>${icon('chevR', 18)}</a>
@@ -440,8 +463,11 @@ export function Settings() {
   ${pageHead('Settings')}
   <section class="card form">
     <label class="field"><span>Your name</span><input id="set-name" value="${esc(s.settings.name)}" autocomplete="given-name"></label>
+    <label class="field"><span>Your UPI ID</span><input id="set-upi" value="${esc(s.settings.upi || '')}" placeholder="yourname@oksbi" autocomplete="off" autocapitalize="none"></label>
+    <p class="from-note">Added to payment reminders so friends can pay you back easily.</p>
     <div class="field"><span>Appearance</span><div class="seg">${['system', 'light', 'dark'].map((t) => `<button class="${theme === t ? 'on' : ''}" data-theme-set="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div></div>
   </section>
+  <a class="card ml-row solo" href="#/reminders">${icon('bell', 20)}<span><strong>Reminders</strong><span>${Push.permission() === 'granted' ? 'Notifications are on' : 'Turn on daily, bill and weekly reminders'}</span></span>${icon('chevR', 18)}</a>
   <section class="card form">
     <h2>PIN lock</h2>
     <p class="muted small">Ask for a 4-digit PIN when the app opens or comes back after a minute.</p>
@@ -463,7 +489,60 @@ export function Settings() {
     <input type="file" id="restore-file" accept="application/json,.json" hidden>
   </section>
   <button class="btn danger wide" data-act="reset">${icon('trash', 18)} Erase all data</button>
-  <p class="hint center">Kharcha 2.0</p>`;
+  <p class="hint center">Kharcha 2.1</p>`;
+}
+
+// ---------------- REMINDERS ----------------
+export function Reminders() {
+  const perm = Push.permission();
+  const pr = Push.prefs();
+  const sync = syncConfig();
+  const st = Push.status;
+  const on = perm === 'granted';
+  const tg = (key, title, sub, extra = '') => `<div class="rem-row"><button class="toggle ${pr[key] ? 'on' : ''}" data-notify="${key}" ${on ? '' : 'disabled'}><span class="tg-text"><strong>${title}</strong><span>${sub}</span></span><span class="tg-sw"></span></button>${extra}</div>`;
+  let top;
+  if (perm === 'unsupported') top = `<section class="card">${empty('Notifications aren’t available here', 'Open Kharcha from the installed app on your phone (Chrome → Install app) to get reminders.', '')}</section>`;
+  else if (perm === 'denied') top = `<section class="card notif-hero blocked"><span class="nh-ic">${icon('bell', 26)}</span><h2>Notifications are blocked</h2><p class="muted">Long-press the Kharcha icon → App info → Notifications → Allow. Or in Chrome: ⋮ → Settings → Site settings → Notifications, and allow your Kharcha site.</p></section>`;
+  else if (!on) top = `<section class="card notif-hero"><span class="nh-ic">${icon('bell', 26)}</span><h2>Get reminders on your phone</h2>
+    <ul class="nh-list"><li>A nudge at night to log the day’s spending</li><li>Bills due today or tomorrow</li><li>A Sunday summary with who owes you money</li></ul>
+    <button class="btn primary wide" data-act="notif-on">${icon('bell', 18)} Turn on notifications</button></section>`;
+  else top = `<section class="card notif-hero on"><span class="nh-ic">${icon('bell', 26)}</span><h2>Notifications are on</h2><p class="muted">${Push.serverOn() ? 'Reminders arrive on time, even when Kharcha is closed.' : 'Reminders work best with the reminder server below.'}</p></section>`;
+
+  const serverCard = perm === 'unsupported' ? '' : Push.serverOn()
+    ? `<section class="card"><div class="srv on">${icon('check', 18)}<span><strong>Reminder server connected</strong><span>Your Supabase project sends reminders at the right time.</span></span></div>
+       <div class="btn-list"><button class="btn ghost" data-act="push-test">${icon('bell', 18)} Send a test from the server</button></div></section>`
+    : `<section class="card form">
+      <h2>On-time reminders (optional, 10 minutes)</h2>
+      <p class="muted small">Without this, Android decides when Kharcha can check in the background, so reminders can come late or be skipped. With it, your Supabase project sends them at the exact time.</p>
+      ${st.error ? `<p class="form-err">${esc(st.error)}</p>` : ''}
+      ${!sync.signedIn ? `<a class="btn ghost" href="#/sync">${icon('cloud', 18)} Turn on Sync first</a>` : ''}
+      <details class="steps-d"><summary>Show setup steps</summary>
+      <ol class="steps">
+        <li>In Supabase, open <strong>Edge Functions → Deploy a new function → Via Editor</strong>. Name it <strong>kharcha-reminders</strong>, delete the sample code, paste in the code from <strong>supabase/kharcha-reminders.ts</strong>, and click <strong>Deploy</strong>.</li>
+        <li>Open the function’s <strong>Details</strong> tab, turn off <strong>Verify JWT with legacy secret</strong> (“Enforce JWT verification”), and save.</li>
+        <li>Open <strong>Edge Functions → Secrets</strong> and add these three:
+          <div class="kv"><span>VAPID_PUBLIC_KEY</span><code id="vapid-pub">${esc(Push.VAPID_PUBLIC_KEY)}</code><button class="btn ghost sm" data-copy="vapid-pub">${icon('copy', 16)} Copy</button></div>
+          <div class="kv"><span>VAPID_PRIVATE_KEY</span><em>the private key from your chat with Claude. Never put it on GitHub.</em></div>
+          <div class="kv"><span>VAPID_SUBJECT</span><code>mailto:your-email@gmail.com</code></div></li>
+        <li>Open <strong>SQL Editor</strong>, paste this and click <strong>Run</strong>:
+          <pre class="sql" id="push-sql">${esc(pushSql())}</pre><button class="btn ghost sm" data-copy="push-sql">${icon('copy', 16)} Copy SQL</button></li>
+        <li>Come back here and tap <strong>Connect this phone</strong>.</li>
+      </ol></details>
+      <button class="btn primary" data-act="push-connect" ${on && sync.signedIn ? '' : 'disabled'}>${icon('cloud', 18)} Connect this phone</button>
+    </section>`;
+
+  return `
+  ${pageHead('Reminders')}
+  ${top}
+  ${perm === 'unsupported' ? '' : `<section class="card form rem ${on ? '' : 'dim'}">
+    <h2>What to remind you about</h2>
+    ${tg('daily', 'Daily reminder', 'If you haven’t logged anything, it asks you to. If you have, it shows today’s total.', `<label class="rem-time"><span>Time</span><input type="time" id="notify-time" value="${pr.dailyTime}" ${on ? '' : 'disabled'}></label>`)}
+    ${tg('bills', 'Bills due', 'At 9 AM on the day before and the day a bill is due.')}
+    ${tg('weekly', 'Weekly summary', 'Sunday at 10 AM: what you spent, and who owes whom.')}
+    <button class="btn ghost" data-act="notif-test" ${on ? '' : 'disabled'}>${icon('bell', 18)} Show a test notification</button>
+  </section>`}
+  ${serverCard}
+  ${on ? `<button class="btn danger wide" data-act="notif-off">${icon('x', 18)} Turn off all notifications</button>` : ''}`;
 }
 
 // ---------------- SYNC ----------------

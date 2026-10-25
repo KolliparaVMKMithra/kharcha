@@ -27,7 +27,7 @@ function setStatus(state, message = '') { status.state = state; status.message =
 export const onStatus = (f) => { subs.add(f); return () => subs.delete(f); };
 export const config = () => ({ url: cfg.url || '', key: cfg.key || '', email: cfg.session?.user?.email || '', signedIn: !!cfg.session, lastSync: cfg.lastSync || null });
 
-const base = () => cfg.url.replace(/\/+$/, '');
+const base = () => (cfg.url || '').replace(/\/+$/, '');
 async function call(path, { method = 'GET', body, auth = true, headers = {} } = {}) {
   const h = { apikey: cfg.key, 'Content-Type': 'application/json', ...headers };
   if (auth) { await ensureToken(); h.Authorization = `Bearer ${cfg.session.access_token}`; }
@@ -111,6 +111,43 @@ export async function syncNow() {
     } finally { running = null; }
   })();
   return running;
+}
+
+// ---------- reminder server (push) ----------
+export const PUSH_SQL = `create table if not exists public.kharcha_push (
+  endpoint text primary key,
+  user_id uuid not null default auth.uid() references auth.users on delete cascade,
+  p256dh text not null,
+  auth text not null,
+  prefs jsonb not null default '{}',
+  tz_offset int not null default 330,
+  last_sent jsonb not null default '{}',
+  updated_at timestamptz not null default now()
+);
+alter table public.kharcha_push enable row level security;
+create policy "own push" on public.kharcha_push
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+select cron.schedule('kharcha-reminders', '*/10 * * * *', $$
+  select net.http_post(
+    url := '__URL__/functions/v1/kharcha-reminders',
+    headers := '{"Content-Type": "application/json"}'::jsonb,
+    body := '{}'::jsonb
+  );
+$$);`;
+export const pushSql = () => PUSH_SQL.replace('__URL__', base() || 'https://YOUR-PROJECT.supabase.co');
+export async function upsertPush(row) {
+  if (!signedIn()) throw new Error('Turn on sync first');
+  await call('/rest/v1/kharcha_push?on_conflict=endpoint', { method: 'POST', body: [{ ...row, user_id: cfg.session.user.id, updated_at: new Date().toISOString() }], headers: { Prefer: 'resolution=merge-duplicates,return=minimal' } });
+}
+export async function deletePush(endpoint) {
+  if (!signedIn()) return;
+  await call(`/rest/v1/kharcha_push?endpoint=eq.${encodeURIComponent(endpoint)}`, { method: 'DELETE' });
+}
+export async function invokeFn(name, body) {
+  return call(`/functions/v1/${name}`, { method: 'POST', body });
 }
 
 export function startAutoSync() {

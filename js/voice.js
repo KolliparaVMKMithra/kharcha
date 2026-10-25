@@ -139,6 +139,18 @@ export function parseCommand(raw, ctx) {
     return { kind: 'txn', draft: { type: 'income', amount, date, personId: p?.id || null, categoryId, mode, note: p ? '' : noteFrom(raw) } };
   }
   const categoryId = guessCategory(s, ctx.categories) || 'other';
+  // Splits: "split 900 dinner with Ravi and Kiran", "Ravi paid 600 for movie split with me"
+  if (/\b(split|splitting|shared|share it|between us|divide)\b/.test(s)) {
+    const named = ctx.people.filter((x) => x.relation !== 'Family' || has(s, x.name.toLowerCase())).filter((x) => has(s, x.name.toLowerCase()));
+    const payerP = named.find((x) => new RegExp(`\\b${x.name.toLowerCase()}\\s+(paid|has paid|payed)\\b`).test(s) || new RegExp(`\\bpaid by\\s+${x.name.toLowerCase()}\\b`).test(s));
+    if (named.length) {
+      let note = noteFrom(raw);
+      for (const x of named) note = note.replace(new RegExp(`\\b${x.name}\\b`, 'gi'), ' ');
+      note = note.replace(/\b(split|splitting|shared|share it|between us|divide|equally|with me|with|and|me|by)\b/gi, ' ').replace(/^\s*(for|on|of|the|a)\b/i, ' ').replace(/\s+/g, ' ').trim();
+      note = note ? note[0].toUpperCase() + note.slice(1) : '';
+      return { kind: 'txn', draft: { type: 'expense', amount, date, categoryId, mode: guessMode(s) || ctx.lastMode.expense, note, tripId: trip?.id || null, splitOn: true, split: ['me', ...named.map((x) => x.id)], payer: payerP ? payerP.id : 'me', splitMode: 'equal' } };
+    }
+  }
   return { kind: 'txn', draft: { type: 'expense', amount, date, categoryId, mode: guessMode(s) || ctx.lastMode.expense, note: noteFrom(raw), tripId: trip?.id || null } };
 }
 
